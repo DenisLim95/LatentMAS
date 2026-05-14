@@ -1,7 +1,6 @@
 import os
 import csv
 import torch
-import matplotlib.pyplot as plt
 from typing import Dict, List, Optional, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -10,6 +9,11 @@ try:
     _HAS_VLLM = True
 except ImportError:
     _HAS_VLLM = False
+
+try:
+    from transformers.cache_utils import Cache as _HFCache
+except ImportError:
+    _HFCache = None
 
 
 def _ensure_pad_token(tokenizer: AutoTokenizer) -> None:
@@ -21,10 +25,27 @@ def _ensure_pad_token(tokenizer: AutoTokenizer) -> None:
 
 
 def _past_length(past_key_values: Optional[Tuple]) -> int:
-    if not past_key_values:
+    if past_key_values is None:
         return 0
-    k = past_key_values[0][0]
-    return k.shape[-2]
+    # Transformers 4.4x+: Cache / DynamicCache (not tuple-indexable)
+    if _HFCache is not None and isinstance(past_key_values, _HFCache):
+        if hasattr(past_key_values, "get_seq_length"):
+            try:
+                return int(past_key_values.get_seq_length())
+            except (TypeError, ValueError):
+                pass
+        if hasattr(past_key_values, "to_legacy_cache"):
+            legacy = past_key_values.to_legacy_cache()
+            if not legacy:
+                return 0
+            k = legacy[0][0]
+            return k.shape[-2]
+        return 0
+    try:
+        k = past_key_values[0][0]
+        return k.shape[-2]
+    except (TypeError, IndexError, AttributeError):
+        return 0
 
 
 class ModelWrapper:
@@ -228,15 +249,8 @@ class ModelWrapper:
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, device=self.device)
         prompt_lengths = attention_mask.sum(dim=1).tolist()
-        cache_position = None
         if past_key_values is not None:
             past_len = _past_length(past_key_values)
-            cache_position = torch.arange(
-                past_len,
-                past_len + input_ids.shape[-1],
-                dtype=torch.long,
-                device=self.device,
-            )
             if past_len > 0:
                 past_mask = torch.ones(
                     (attention_mask.shape[0], past_len),
@@ -255,7 +269,6 @@ class ModelWrapper:
             return_dict_in_generate=True,
             output_scores=False,
             past_key_values=past_key_values,
-            cache_position=cache_position,
         )
         sequences = outputs.sequences
         generations: List[str] = []
